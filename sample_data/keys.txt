@@ -1,0 +1,2 @@
+FREE_KEY=sk-free-124ce0ee9e41ee22a30d3057
+PREM_KEY=sk-prem-e8e78cc73c6ff253ba10f469

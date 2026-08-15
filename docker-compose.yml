@@ -1,0 +1,146 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# docker-compose.yml — Production YOLO Vision API Stack
+#
+# Services:
+#   yolo-api  — FastAPI inference service (built from local Dockerfile)
+#   redis     — Rate-limiting & caching backend (redis:7-alpine, internal only)
+#
+# Networks:
+#   frontend  — Exposes the API to the host (port 8000)
+#   backend   — Private bridge for API ↔ Redis communication
+#
+# Volumes:
+#   models_data  — Persists YOLO .pt weight files (bind-mounted from ./models)
+#   redis_data   — Persists Redis AOF/RDB snapshots
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── YOLO FastAPI Inference Service ─────────────────────────────────────────
+  yolo-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # Pass --build-arg to customise the image at build time
+      args:
+        BUILDKIT_INLINE_CACHE: "1"
+
+    image: yolo-vision-api:latest
+    container_name: yolo-api
+
+    # Load non-secret env vars from .env; secrets should use Docker Secrets
+    # or a secrets manager in production.
+    env_file:
+      - .env
+
+    environment:
+      # Override specific values on top of .env
+      REDIS_URL: "redis://:${REDIS_PASSWORD:-}@redis:6379/0"
+      HOST: "0.0.0.0"
+      PORT: "8000"
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+
+    ports:
+      # Expose API to the host on port 8000.
+      # In production, put an Nginx/Traefik reverse proxy in front and
+      # do NOT expose this port directly to the internet.
+      - "${API_PORT:-8000}:8000"
+
+    volumes:
+      # Mount model weights directory from host — avoids baking large .pt
+      # files into the image. Download weights to ./models/ before starting.
+      - type: bind
+        source: ./models
+        target: /app/models
+        read_only: true
+
+    depends_on:
+      redis:
+        condition: service_healthy
+
+    networks:
+      - frontend
+      - backend
+
+    restart: unless-stopped
+
+    # Resource limits — tune based on hardware
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: "4G"
+        reservations:
+          cpus: "1.0"
+          memory: "1G"
+
+    # Application-level healthcheck (mirrors the Dockerfile HEALTHCHECK)
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 30s
+      timeout: 10s
+      start_period: 90s   # Allow time for model to load on first start
+      retries: 3
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # ── Redis — Rate Limiting & Caching Backend ─────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: yolo-redis
+
+    command: >
+      redis-server
+        --appendonly yes
+        --appendfsync everysec
+        --maxmemory 256mb
+        --maxmemory-policy allkeys-lru
+        ${REDIS_PASSWORD:+--requirepass ${REDIS_PASSWORD}}
+
+    volumes:
+      - redis_data:/data
+
+    # Redis is on the backend network only — NOT accessible from the host
+    networks:
+      - backend
+
+    restart: unless-stopped
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 5
+
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: "384M"
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+
+# ── Named Volumes ─────────────────────────────────────────────────────────────
+volumes:
+  redis_data:
+    driver: local
+
+
+# ── Networks ──────────────────────────────────────────────────────────────────
+networks:
+  frontend:
+    driver: bridge
+
+  backend:
+    driver: bridge
+    internal: true   # No external internet access from backend network
